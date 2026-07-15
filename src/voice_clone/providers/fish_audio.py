@@ -7,7 +7,6 @@ import httpx
 
 from . import (
     AudioResult,
-    BaseSFXProvider,
     BaseTTSProvider,
     BaseVoiceCloningProvider,
     VoiceInfo,
