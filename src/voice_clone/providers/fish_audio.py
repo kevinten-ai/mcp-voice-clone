@@ -1,7 +1,6 @@
 """Fish Audio provider — Best Chinese voice cloning + TTS."""
 
 from __future__ import annotations
-import os
 
 import httpx
 
@@ -9,7 +8,13 @@ from . import (
     AudioResult,
     BaseTTSProvider,
     BaseVoiceCloningProvider,
+    MAX_AUDIO_RESPONSE_BYTES,
     VoiceInfo,
+    load_audio_sample,
+    read_error_text,
+    read_limited_json,
+    read_limited_stream,
+    validate_audio_content_type,
 )
 
 
@@ -45,30 +50,10 @@ class FishAudioProvider(BaseTTSProvider, BaseVoiceCloningProvider):
     ) -> VoiceInfo:
         """Clone a voice from an audio sample.
 
-        POST /v1/voices — multipart upload with name, description, and audio file.
+        POST /model — multipart upload with name, description, and audio file.
         Returns a VoiceInfo with the new voice_id.
         """
-        audio_path_resolved = os.path.expanduser(audio_path)
-        if not os.path.isfile(audio_path_resolved):
-            raise FileNotFoundError(f"Audio file not found: {audio_path_resolved}")
-
-        filename = os.path.basename(audio_path_resolved)
-
-        # Determine content type from extension
-        ext = os.path.splitext(filename)[1].lower()
-        content_types = {
-            ".mp3": "audio/mpeg",
-            ".wav": "audio/wav",
-            ".flac": "audio/flac",
-            ".ogg": "audio/ogg",
-            ".m4a": "audio/mp4",
-            ".aac": "audio/aac",
-            ".webm": "audio/webm",
-        }
-        content_type = content_types.get(ext, "audio/mpeg")
-
-        with open(audio_path_resolved, "rb") as f:
-            audio_bytes = f.read()
+        filename, audio_bytes, content_type = load_audio_sample(audio_path)
 
         files = {
             "voices": (filename, audio_bytes, content_type),
@@ -82,24 +67,37 @@ class FishAudioProvider(BaseTTSProvider, BaseVoiceCloningProvider):
         data["title"] = name
 
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
+            async with client.stream(
+                "POST",
                 f"{self.BASE_URL}/model",
                 headers=self._headers(),
                 data=data,
                 files=files,
                 timeout=120.0,
-            )
+            ) as resp:
+                try:
+                    result = await read_limited_json(resp)
+                except ValueError as e:
+                    raise RuntimeError(
+                        f"Fish Audio clone_voice failed (HTTP {resp.status_code}): {e}"
+                    ) from e
 
             if resp.status_code not in (200, 201):
-                try:
-                    err = resp.json()
-                    msg = err.get("message", err.get("detail", resp.text))
-                except Exception:
-                    msg = resp.text
-                raise RuntimeError(f"Fish Audio clone_voice failed (HTTP {resp.status_code}): {msg}")
+                if isinstance(result, dict):
+                    msg = result.get("message", result.get("detail", "unknown error"))
+                else:
+                    msg = result
+                raise RuntimeError(
+                    f"Fish Audio clone_voice failed (HTTP {resp.status_code}): {str(msg)[:1_000]}"
+                )
 
-            result = resp.json()
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "Fish Audio clone_voice returned an invalid response"
+                )
             voice_id = result.get("_id", result.get("id", ""))
+            if not isinstance(voice_id, str) or not voice_id:
+                raise RuntimeError("Fish Audio clone_voice returned no voice ID")
             return VoiceInfo(
                 voice_id=voice_id,
                 name=name,
@@ -132,7 +130,8 @@ class FishAudioProvider(BaseTTSProvider, BaseVoiceCloningProvider):
             body["prosody"] = {"speed": speed}
 
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
+            async with client.stream(
+                "POST",
                 f"{self.BASE_URL}/v1/tts",
                 headers={
                     **self._headers(),
@@ -140,19 +139,25 @@ class FishAudioProvider(BaseTTSProvider, BaseVoiceCloningProvider):
                 },
                 json=body,
                 timeout=120.0,
-            )
+            ) as resp:
+                if resp.status_code != 200:
+                    msg = await read_error_text(resp)
+                    return AudioResult(
+                        status="failed",
+                        error=f"Fish Audio TTS failed (HTTP {resp.status_code}): {msg}",
+                    )
 
-            if resp.status_code != 200:
                 try:
-                    err = resp.json()
-                    msg = err.get("message", err.get("detail", resp.text))
-                except Exception:
-                    msg = resp.text
-                return AudioResult(status="failed", error=f"Fish Audio TTS failed (HTTP {resp.status_code}): {msg}")
-
-            audio_data = resp.content
-            if not audio_data or len(audio_data) == 0:
-                return AudioResult(status="failed", error="Fish Audio returned empty audio")
+                    validate_audio_content_type(resp.headers.get("content-type"))
+                    audio_data = await read_limited_stream(
+                        resp, MAX_AUDIO_RESPONSE_BYTES
+                    )
+                except ValueError as e:
+                    return AudioResult(status="failed", error=str(e))
+                if not audio_data:
+                    return AudioResult(
+                        status="failed", error="Fish Audio returned empty audio"
+                    )
 
             return AudioResult(status="success", audio_data=audio_data)
 
@@ -164,30 +169,36 @@ class FishAudioProvider(BaseTTSProvider, BaseVoiceCloningProvider):
         voices: list[VoiceInfo] = []
 
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
+            async with client.stream(
+                "GET",
                 f"{self.BASE_URL}/model",
                 headers=self._headers(),
                 params={"page_size": 100, "page_number": 1, "title": "", "self": True},
                 timeout=30.0,
-            )
-
-            if resp.status_code != 200:
-                return voices
-
-            data = resp.json()
-            items = data.get("items", data) if isinstance(data, dict) else data
+            ) as resp:
+                if resp.status_code != 200:
+                    return voices
+                try:
+                    data = await read_limited_json(resp)
+                except ValueError:
+                    return voices
+                items = data.get("items", data) if isinstance(data, dict) else data
             if not isinstance(items, list):
                 items = []
 
             for item in items:
+                if not isinstance(item, dict):
+                    continue
                 voice_id = item.get("_id", item.get("id", ""))
                 name = item.get("title", item.get("name", ""))
                 desc = item.get("description", "")
-                voices.append(VoiceInfo(
-                    voice_id=voice_id,
-                    name=name,
-                    description=desc,
-                    provider=self.name,
-                ))
+                voices.append(
+                    VoiceInfo(
+                        voice_id=voice_id,
+                        name=name,
+                        description=desc,
+                        provider=self.name,
+                    )
+                )
 
         return voices
