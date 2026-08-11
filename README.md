@@ -25,7 +25,9 @@
 - **Best Chinese voice cloning** — Fish Audio excels at Chinese voice cloning, very affordable
 - **Premium English voices** — ElevenLabs for natural, expressive English speech
 - **Provider switching** — Choose the best provider per request via `provider` parameter
-- **Auto-save** — Generated audio saved to local disk automatically
+- **Safe auto-save** — MP3 output uses microsecond filenames and never overwrites existing files
+- **Bounded media** — Clone samples are capped at 25 MiB and provider audio responses at 50 MiB
+- **Validated requests** — TTS speed, SFX duration, text lengths, formats, and provider errors are bounded in Schema and runtime
 
 ## Supported Providers
 
@@ -58,7 +60,20 @@ cd mcp-voice-clone
 uv sync
 ```
 
-### 2. Configure MCP
+### 2. Use the Codex task profile
+
+The local server is registered disabled by default. Start a new Codex session with
+only the voice profile enabled:
+
+```bash
+codex-mcp run voice -- --cd /path/to/project
+```
+
+The profile applies only to the new Codex session and does not modify the base
+Codex configuration. Configure provider keys in the registered local server rather
+than placing real keys in repository files or command history.
+
+### 3. Compatibility configuration
 
 Configure the providers you want to use. At least one API key is required.
 
@@ -105,7 +120,7 @@ claude mcp add -s user mcp-voice-clone \
 
 </details>
 
-### 3. Use it
+### 4. Use it
 
 Clone a voice and generate speech:
 
@@ -121,11 +136,11 @@ Clone a voice and generate speech:
 - **clone_voice** — Clone a voice from an audio sample. Params: `audio_path` (required), `name` (required), `description`, `provider` (fish-audio/elevenlabs). Returns: voice_id for use with `speak`.
 
 ### Speech
-- **speak** — Generate speech with a cloned or preset voice. Params: `text` (required), `voice_id` (required), `provider` (fish-audio/elevenlabs), `speed` (0.5-2.0), `output_path`.
+- **speak** — Generate speech with a cloned or preset voice. Params: `text` (required, at most 10,000 characters), `voice_id` (required), `provider` (fish-audio/elevenlabs), `speed` (0.7-1.2), `output_path` (new `.mp3` only).
 - **list_voices** — List available voices for a provider. Params: `provider` (fish-audio/elevenlabs).
 
 ### Sound Effects
-- **generate_sfx** — Generate sound effects from a text description. Params: `prompt` (required), `duration` (seconds), `output_path`. Provider: ElevenLabs.
+- **generate_sfx** — Generate sound effects from a text description. Params: `prompt` (required, at most 2,000 characters), `duration` (0.5-30 seconds), `output_path` (new `.mp3` only). Provider: ElevenLabs.
 
 ### Utility
 - **list_providers** — Show all configured voice cloning, TTS, and SFX providers.
@@ -146,7 +161,7 @@ Clone a voice and generate speech:
 1. Visit https://fish.audio → Sign Up
 2. Go to **API Keys**: https://fish.audio/account/api-keys
 3. Click "Create API Key" → copy
-4. Set `FISH_AUDIO_API_KEY` in your MCP config
+4. Create a dedicated key with the narrowest provider permissions available and set `FISH_AUDIO_API_KEY` in your local MCP config
 
 **Voice Cloning Tips:**
 - Upload a clear, 10-30 second audio sample for best results
@@ -170,7 +185,7 @@ Clone a voice and generate speech:
 1. Visit https://elevenlabs.io → Sign Up
 2. Go to **Profile + API Key**: https://elevenlabs.io/app/settings/api-keys
 3. Click "Create API Key" → copy
-4. Set `ELEVENLABS_API_KEY` in your MCP config
+4. Create a restricted API key that only grants the required voice capabilities and set `ELEVENLABS_API_KEY` in your local MCP config
 
 **Features:**
 - Instant voice cloning from a short audio sample (paid plans)
@@ -197,6 +212,10 @@ Clone a voice and generate speech:
 | `No providers configured` | No API keys set | Set at least one API key |
 | `Unknown provider: xxx` | Typo or provider not configured | Check `list_providers` for available options |
 | `Audio file not found` | Invalid audio_path | Check the file path exists and is accessible |
+| `Output file already exists` | Output would overwrite a file | Choose a new `.mp3` path or remove the old file explicitly |
+| `Unsupported audio sample format` | Clone sample extension is not supported | Use MP3, WAV, FLAC, OGG, M4A, AAC, or WebM |
+| `Audio sample is too large` | Clone sample exceeds the local 25 MiB safety limit | Trim or compress the sample before cloning |
+| `Provider response is too large` | Generated audio exceeds the 50 MiB safety limit | Shorten the text or requested duration |
 
 ### Provider-Specific Errors
 
@@ -214,6 +233,8 @@ Clone a voice and generate speech:
 - **ElevenLabs** free tier includes 10,000 characters/month for TTS and access to preset voices
 - **Voice cloning** quality depends heavily on the audio sample quality — use clean, clear recordings
 - **Sound effects** via ElevenLabs accept natural language descriptions, be descriptive for best results
+- Custom output paths must use `.mp3` and must not already exist. Output validation happens before a billable provider request.
+- Provider audio is streamed with a 50 MiB cap; JSON metadata and error previews also have bounded sizes.
 
 ## Project Structure
 
@@ -249,11 +270,12 @@ uv run voice-clone
 npx @modelcontextprotocol/inspector uv --directory . run voice-clone
 ```
 
-## Related Projects
+## Related Media Workflow
 
-- [mcp-video-gen](https://github.com/kevinten-ai/mcp-video-gen) — AI video generation MCP server (7 providers)
-- [mcp-image-gen](https://github.com/kevinten-ai/mcp-image-gen) — AI image generation MCP server (Gemini + Imagen)
-- [mcp-3d-gen](https://github.com/kevinten-ai/mcp-3d-gen) — AI 3D model generation MCP server
+Image generation, image editing, and video generation use AnyCap CLI by default;
+the image/video MCP projects are compatibility-only. Enable this MCP through the
+`voice` profile only when an agent needs live voice cloning, TTS, voice lookup, or
+sound-effect generation during its reasoning loop.
 
 ## License
 

@@ -11,10 +11,12 @@ import mcp.server.stdio
 
 from .providers import (
     BaseVoiceCloningProvider,
+    MAX_AUDIO_RESPONSE_BYTES,
     register_tts,
     list_tts as get_all_tts,
     register_sfx,
     list_sfx as get_all_sfx,
+    validate_audio_sample_path,
 )
 from .providers.fish_audio import FishAudioProvider
 from .providers.elevenlabs import (
@@ -24,6 +26,20 @@ from .providers.elevenlabs import (
 )
 
 AUDIO_OUTPUT_DIR = os.getenv("AUDIO_OUTPUT_DIR", os.path.join(os.getcwd(), "output"))
+MAX_AUDIO_OUTPUT_BYTES = MAX_AUDIO_RESPONSE_BYTES
+MAX_PATH_CHARS = 4_096
+MAX_TTS_TEXT_CHARS = 10_000
+MAX_SFX_PROMPT_CHARS = 2_000
+MAX_VOICE_ID_CHARS = 256
+MAX_VOICE_NAME_CHARS = 100
+MAX_DESCRIPTION_CHARS = 1_000
+MAX_PROVIDER_NAME_CHARS = 64
+MIN_SPEECH_SPEED = 0.7
+MAX_SPEECH_SPEED = 1.2
+MIN_SFX_DURATION = 0.5
+MAX_SFX_DURATION = 30.0
+MAX_LISTED_VOICES = 100
+MAX_TOOL_OUTPUT_CHARS = 20_000
 
 server = Server("mcp-voice-clone")
 
@@ -42,7 +58,9 @@ def _init_providers() -> None:
     elevenlabs_key = os.getenv("ELEVENLABS_API_KEY", "")
     if elevenlabs_key:
         register_tts(ElevenLabsTTSProvider(elevenlabs_key))
-        _voice_cloning_providers["elevenlabs"] = ElevenLabsVoiceCloningProvider(elevenlabs_key)
+        _voice_cloning_providers["elevenlabs"] = ElevenLabsVoiceCloningProvider(
+            elevenlabs_key
+        )
         register_sfx(ElevenLabsSFXProvider(elevenlabs_key))
 
 
@@ -66,14 +84,79 @@ def _default_cloning_name() -> str | None:
     return None
 
 
-def _save_audio_bytes(data: bytes, output_dir: str, prefix: str, ext: str = "mp3") -> str:
+def _validate_string(value: object, field: str, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    if not value.strip():
+        raise ValueError(f"{field} must not be empty")
+    if len(value) > maximum:
+        raise ValueError(f"{field} must be at most {maximum} characters")
+    return value
+
+
+def _validate_number(
+    value: object,
+    field: str,
+    minimum: float,
+    maximum: float,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number")
+    number = float(value)
+    if not minimum <= number <= maximum:
+        raise ValueError(f"{field} must be between {minimum} and {maximum}")
+    return number
+
+
+def _audio_output_path(
+    output_dir: str,
+    prefix: str,
+    output_path: str | None = None,
+) -> Path:
+    if output_path is not None:
+        filepath = Path(_validate_string(output_path, "output_path", MAX_PATH_CHARS))
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filepath = Path(output_dir) / f"{prefix}_{timestamp}.mp3"
+    if filepath.suffix.lower() != ".mp3":
+        raise ValueError("output_path must use the .mp3 extension")
+    if filepath.exists():
+        raise FileExistsError(f"Output file already exists: {filepath}")
+    return filepath
+
+
+def _save_audio_bytes(
+    data: bytes,
+    output_dir: str,
+    prefix: str,
+    ext: str = "mp3",
+    output_path: str | None = None,
+) -> str:
     """Save raw audio bytes to disk."""
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = out / f"{prefix}_{timestamp}.{ext}"
-    filepath.write_bytes(data)
+    if ext.lower() != "mp3":
+        raise ValueError("Only MP3 output is supported")
+    if not isinstance(data, bytes) or not data:
+        raise ValueError("Provider returned no audio data")
+    if len(data) > MAX_AUDIO_OUTPUT_BYTES:
+        raise ValueError(
+            f"Provider audio is too large ({len(data)} bytes); maximum is {MAX_AUDIO_OUTPUT_BYTES} bytes"
+        )
+    filepath = _audio_output_path(output_dir, prefix, output_path)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    created = False
+    try:
+        with filepath.open("xb") as handle:
+            created = True
+            handle.write(data)
+    except Exception:
+        if created:
+            filepath.unlink(missing_ok=True)
+        raise
     return str(filepath)
+
+
+def _bounded_error(value: object) -> str:
+    return str(value or "unknown error")[:1_000]
 
 
 @server.list_tools()
@@ -92,121 +175,159 @@ async def handle_list_tools() -> list[types.Tool]:
 
     # clone_voice tool
     if cloning_names:
-        tools.append(types.Tool(
-            name="clone_voice",
-            description=f"Clone a voice from an audio sample. The returned voice_id can be used with the speak tool. Available providers: {', '.join(cloning_names)}. Default: {default_cloning}.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "audio_path": {
-                        "type": "string",
-                        "description": "Path to the reference voice audio sample (mp3, wav, flac, m4a, etc.)",
+        tools.append(
+            types.Tool(
+                name="clone_voice",
+                description=f"Clone a voice from an audio sample. The returned voice_id can be used with the speak tool. Available providers: {', '.join(cloning_names)}. Default: {default_cloning}.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "audio_path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_PATH_CHARS,
+                            "description": "Path to the reference voice audio sample (mp3, wav, flac, m4a, etc.)",
+                        },
+                        "name": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_VOICE_NAME_CHARS,
+                            "description": "Name for the cloned voice",
+                        },
+                        "description": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_DESCRIPTION_CHARS,
+                            "description": "Optional description of the voice",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_PROVIDER_NAME_CHARS,
+                            "description": f"Provider to use: {', '.join(cloning_names)}. Default: {default_cloning}",
+                            "enum": cloning_names,
+                        },
                     },
-                    "name": {
-                        "type": "string",
-                        "description": "Name for the cloned voice",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Optional description of the voice",
-                    },
-                    "provider": {
-                        "type": "string",
-                        "description": f"Provider to use: {', '.join(cloning_names)}. Default: {default_cloning}",
-                        "enum": cloning_names,
-                    },
+                    "required": ["audio_path", "name"],
                 },
-                "required": ["audio_path", "name"],
-            },
-        ))
+            )
+        )
 
     # speak tool
     if tts_names:
-        tools.append(types.Tool(
-            name="speak",
-            description=f"Generate speech with a cloned or preset voice. Available providers: {', '.join(tts_names)}. Default: {default_tts}.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "The text to convert to speech",
+        tools.append(
+            types.Tool(
+                name="speak",
+                description=f"Generate speech with a cloned or preset voice. Available providers: {', '.join(tts_names)}. Default: {default_tts}.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_TTS_TEXT_CHARS,
+                            "description": "The text to convert to speech",
+                        },
+                        "voice_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_VOICE_ID_CHARS,
+                            "description": "Voice ID to use (from clone_voice result or list_voices). Fish Audio: use reference_id from cloned voice. ElevenLabs: use voice_id.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_PROVIDER_NAME_CHARS,
+                            "description": f"TTS provider: {', '.join(tts_names)}. Default: {default_tts}",
+                            "enum": tts_names,
+                        },
+                        "speed": {
+                            "type": "number",
+                            "description": "Speech speed multiplier (0.7-1.2). Default: 1.0",
+                            "default": 1.0,
+                            "minimum": MIN_SPEECH_SPEED,
+                            "maximum": MAX_SPEECH_SPEED,
+                        },
+                        "output_path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_PATH_CHARS,
+                            "pattern": r"\.[mM][pP]3$",
+                            "description": "Full file path to save the audio. If not provided, saves to output directory with auto-generated name.",
+                        },
                     },
-                    "voice_id": {
-                        "type": "string",
-                        "description": "Voice ID to use (from clone_voice result or list_voices). Fish Audio: use reference_id from cloned voice. ElevenLabs: use voice_id.",
-                    },
-                    "provider": {
-                        "type": "string",
-                        "description": f"TTS provider: {', '.join(tts_names)}. Default: {default_tts}",
-                        "enum": tts_names,
-                    },
-                    "speed": {
-                        "type": "number",
-                        "description": "Speech speed multiplier (0.5-2.0). Default: 1.0",
-                        "default": 1.0,
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Full file path to save the audio. If not provided, saves to output directory with auto-generated name.",
-                    },
+                    "required": ["text", "voice_id"],
                 },
-                "required": ["text", "voice_id"],
-            },
-        ))
+            )
+        )
 
     # list_voices tool
     if tts_names:
-        tools.append(types.Tool(
-            name="list_voices",
-            description=f"List available voices for a provider. Available providers: {', '.join(tts_names)}. Default: {default_tts}.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "provider": {
-                        "type": "string",
-                        "description": f"Provider to list voices from: {', '.join(tts_names)}. Default: {default_tts}",
-                        "enum": tts_names,
+        tools.append(
+            types.Tool(
+                name="list_voices",
+                description=f"List available voices for a provider. Available providers: {', '.join(tts_names)}. Default: {default_tts}.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_PROVIDER_NAME_CHARS,
+                            "description": f"Provider to list voices from: {', '.join(tts_names)}. Default: {default_tts}",
+                            "enum": tts_names,
+                        },
                     },
+                    "required": [],
                 },
-                "required": [],
-            },
-        ))
+            )
+        )
 
     # generate_sfx tool
     if sfx_names:
-        tools.append(types.Tool(
-            name="generate_sfx",
-            description=f"Generate sound effects from a text description. Available providers: {', '.join(sfx_names)}.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "Text description of the sound effect to generate (e.g. 'thunderstorm with heavy rain', 'cat meowing softly')",
+        tools.append(
+            types.Tool(
+                name="generate_sfx",
+                description=f"Generate sound effects from a text description. Available providers: {', '.join(sfx_names)}.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_SFX_PROMPT_CHARS,
+                            "description": "Text description of the sound effect to generate (e.g. 'thunderstorm with heavy rain', 'cat meowing softly')",
+                        },
+                        "duration": {
+                            "type": "number",
+                            "description": "Duration in seconds. Optional — provider will choose a default if omitted.",
+                            "minimum": MIN_SFX_DURATION,
+                            "maximum": MAX_SFX_DURATION,
+                        },
+                        "output_path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_PATH_CHARS,
+                            "pattern": r"\.[mM][pP]3$",
+                            "description": "Full file path to save the audio. If not provided, saves to output directory with auto-generated name.",
+                        },
                     },
-                    "duration": {
-                        "type": "number",
-                        "description": "Duration in seconds. Optional — provider will choose a default if omitted.",
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Full file path to save the audio. If not provided, saves to output directory with auto-generated name.",
-                    },
+                    "required": ["prompt"],
                 },
-                "required": ["prompt"],
-            },
-        ))
+            )
+        )
 
     # list_providers tool (always available)
-    tools.append(types.Tool(
-        name="list_providers",
-        description="List all available voice cloning, TTS, and sound effects providers.",
-        inputSchema={
-            "type": "object",
-            "properties": {},
-        },
-    ))
+    tools.append(
+        types.Tool(
+            name="list_providers",
+            description="List all available voice cloning, TTS, and sound effects providers.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        )
+    )
 
     return tools
 
@@ -236,151 +357,314 @@ async def handle_call_tool(
             for p in sfx.values():
                 lines.append(f"  **{p.name}** - Sound effects generation")
         if not lines:
-            return [types.TextContent(type="text", text="No providers configured. Set FISH_AUDIO_API_KEY or ELEVENLABS_API_KEY.")]
+            return [
+                types.TextContent(
+                    type="text",
+                    text="No providers configured. Set FISH_AUDIO_API_KEY or ELEVENLABS_API_KEY.",
+                )
+            ]
         return [types.TextContent(type="text", text="\n".join(lines))]
 
     if name == "clone_voice":
         audio_path = arguments.get("audio_path")
         voice_name = arguments.get("name")
         if not audio_path or not voice_name:
-            return [types.TextContent(type="text", text="Missing required parameters: audio_path and name")]
+            return [
+                types.TextContent(
+                    type="text", text="Missing required parameters: audio_path and name"
+                )
+            ]
 
-        provider_name = arguments.get("provider") or _default_cloning_name()
+        try:
+            audio_path = _validate_string(audio_path, "audio_path", MAX_PATH_CHARS)
+            validate_audio_sample_path(audio_path)
+            voice_name = _validate_string(voice_name, "name", MAX_VOICE_NAME_CHARS)
+            description = arguments.get("description")
+            if description is not None:
+                description = _validate_string(
+                    description, "description", MAX_DESCRIPTION_CHARS
+                )
+        except (ValueError, FileNotFoundError, OSError) as e:
+            return [types.TextContent(type="text", text=str(e))]
+
+        requested_provider = arguments.get("provider")
+        if requested_provider is not None:
+            try:
+                requested_provider = _validate_string(
+                    requested_provider, "provider", MAX_PROVIDER_NAME_CHARS
+                )
+            except ValueError as e:
+                return [types.TextContent(type="text", text=str(e))]
+        provider_name = requested_provider or _default_cloning_name()
         if not provider_name:
-            return [types.TextContent(type="text", text="No voice cloning providers configured. Set FISH_AUDIO_API_KEY or ELEVENLABS_API_KEY.")]
+            return [
+                types.TextContent(
+                    type="text",
+                    text="No voice cloning providers configured. Set FISH_AUDIO_API_KEY or ELEVENLABS_API_KEY.",
+                )
+            ]
 
         provider = _voice_cloning_providers.get(provider_name)
         if not provider:
             available = ", ".join(_voice_cloning_providers.keys())
-            return [types.TextContent(type="text", text=f"Unknown provider: {provider_name}. Available: {available}")]
-
-        description = arguments.get("description")
+            return [
+                types.TextContent(
+                    type="text",
+                    text=f"Unknown provider: {provider_name}. Available: {available}",
+                )
+            ]
 
         try:
-            voice_info = await provider.clone_voice(audio_path, voice_name, description=description)
+            voice_info = await provider.clone_voice(
+                audio_path, voice_name, description=description
+            )
         except FileNotFoundError as e:
             return [types.TextContent(type="text", text=f"Error: {e}")]
         except RuntimeError as e:
-            return [types.TextContent(type="text", text=f"Clone failed: {e}")]
+            return [
+                types.TextContent(
+                    type="text", text=f"Clone failed: {_bounded_error(e)}"
+                )
+            ]
         except Exception as e:
-            return [types.TextContent(type="text", text=f"Clone failed: {e}")]
+            return [
+                types.TextContent(
+                    type="text", text=f"Clone failed: {_bounded_error(e)}"
+                )
+            ]
 
-        return [types.TextContent(
-            type="text",
-            text=(
-                f"Voice cloned successfully via **{provider_name}**!\n"
-                f"Voice ID: `{voice_info.voice_id}`\n"
-                f"Name: {voice_info.name}\n"
-                f"Use this voice_id with the `speak` tool to generate speech."
-            ),
-        )]
+        return [
+            types.TextContent(
+                type="text",
+                text=(
+                    f"Voice cloned successfully via **{provider_name}**!\n"
+                    f"Voice ID: `{str(voice_info.voice_id)[:MAX_VOICE_ID_CHARS]}`\n"
+                    f"Name: {str(voice_info.name)[:MAX_VOICE_NAME_CHARS]}\n"
+                    f"Use this voice_id with the `speak` tool to generate speech."
+                ),
+            )
+        ]
 
     if name == "speak":
         text = arguments.get("text")
         voice_id = arguments.get("voice_id")
         if not text or not voice_id:
-            return [types.TextContent(type="text", text="Missing required parameters: text and voice_id")]
+            return [
+                types.TextContent(
+                    type="text", text="Missing required parameters: text and voice_id"
+                )
+            ]
 
         tts_providers = get_all_tts()
         if not tts_providers:
-            return [types.TextContent(type="text", text="No TTS providers configured. Set FISH_AUDIO_API_KEY or ELEVENLABS_API_KEY.")]
+            return [
+                types.TextContent(
+                    type="text",
+                    text="No TTS providers configured. Set FISH_AUDIO_API_KEY or ELEVENLABS_API_KEY.",
+                )
+            ]
 
-        provider_name = arguments.get("provider") or _default_tts_name()
+        requested_provider = arguments.get("provider")
+        if requested_provider is not None:
+            try:
+                requested_provider = _validate_string(
+                    requested_provider, "provider", MAX_PROVIDER_NAME_CHARS
+                )
+            except ValueError as e:
+                return [types.TextContent(type="text", text=str(e))]
+        provider_name = requested_provider or _default_tts_name()
         provider = tts_providers.get(provider_name) if provider_name else None
         if not provider:
             available = ", ".join(tts_providers.keys())
-            return [types.TextContent(type="text", text=f"Unknown TTS provider: {provider_name}. Available: {available}")]
+            return [
+                types.TextContent(
+                    type="text",
+                    text=f"Unknown TTS provider: {provider_name}. Available: {available}",
+                )
+            ]
 
-        speed = arguments.get("speed", 1.0)
+        try:
+            text = _validate_string(text, "text", MAX_TTS_TEXT_CHARS)
+            voice_id = _validate_string(voice_id, "voice_id", MAX_VOICE_ID_CHARS)
+            speed = _validate_number(
+                arguments.get("speed", 1.0),
+                "speed",
+                MIN_SPEECH_SPEED,
+                MAX_SPEECH_SPEED,
+            )
+            output_target = _audio_output_path(
+                AUDIO_OUTPUT_DIR,
+                f"speak_{provider_name}",
+                arguments.get("output_path"),
+            )
+        except (ValueError, FileExistsError) as e:
+            return [types.TextContent(type="text", text=str(e))]
 
-        result = await provider.speak(text, voice_id=voice_id, speed=speed)
+        try:
+            result = await provider.speak(text, voice_id=voice_id, speed=speed)
+        except Exception as e:
+            return [
+                types.TextContent(type="text", text=f"TTS failed: {_bounded_error(e)}")
+            ]
 
         if result.status == "failed":
-            return [types.TextContent(type="text", text=f"TTS failed: {result.error}")]
+            return [
+                types.TextContent(
+                    type="text", text=f"TTS failed: {_bounded_error(result.error)}"
+                )
+            ]
 
-        # Save audio
-        output_path = arguments.get("output_path")
-        if output_path:
-            out = Path(output_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            if result.audio_data:
-                out.write_bytes(result.audio_data)
-                filepath = str(out)
-            else:
-                return [types.TextContent(type="text", text="No audio data returned")]
-        else:
-            output_dir = AUDIO_OUTPUT_DIR
-            if result.audio_data:
-                filepath = _save_audio_bytes(result.audio_data, output_dir, f"speak_{provider_name}")
-            else:
-                return [types.TextContent(type="text", text="No audio data returned")]
+        try:
+            filepath = _save_audio_bytes(
+                result.audio_data,
+                AUDIO_OUTPUT_DIR,
+                f"speak_{provider_name}",
+                output_path=str(output_target),
+            )
+        except (ValueError, FileExistsError, OSError) as e:
+            return [types.TextContent(type="text", text=str(e))]
 
-        return [types.TextContent(type="text", text=f"Speech generated via **{provider_name}**.\nSaved to: {filepath}")]
+        return [
+            types.TextContent(
+                type="text",
+                text=f"Speech generated via **{provider_name}**.\nSaved to: {filepath}",
+            )
+        ]
 
     if name == "list_voices":
         tts_providers = get_all_tts()
         if not tts_providers:
-            return [types.TextContent(type="text", text="No TTS providers configured. Set FISH_AUDIO_API_KEY or ELEVENLABS_API_KEY.")]
+            return [
+                types.TextContent(
+                    type="text",
+                    text="No TTS providers configured. Set FISH_AUDIO_API_KEY or ELEVENLABS_API_KEY.",
+                )
+            ]
 
-        provider_name = arguments.get("provider") or _default_tts_name()
+        requested_provider = arguments.get("provider")
+        if requested_provider is not None:
+            try:
+                requested_provider = _validate_string(
+                    requested_provider, "provider", MAX_PROVIDER_NAME_CHARS
+                )
+            except ValueError as e:
+                return [types.TextContent(type="text", text=str(e))]
+        provider_name = requested_provider or _default_tts_name()
         provider = tts_providers.get(provider_name) if provider_name else None
         if not provider:
             available = ", ".join(tts_providers.keys())
-            return [types.TextContent(type="text", text=f"Unknown provider: {provider_name}. Available: {available}")]
+            return [
+                types.TextContent(
+                    type="text",
+                    text=f"Unknown provider: {provider_name}. Available: {available}",
+                )
+            ]
 
         try:
             voices = await provider.list_voices()
         except Exception as e:
-            return [types.TextContent(type="text", text=f"Failed to list voices: {e}")]
+            return [
+                types.TextContent(
+                    type="text", text=f"Failed to list voices: {_bounded_error(e)}"
+                )
+            ]
 
         if not voices:
-            return [types.TextContent(type="text", text=f"No voices found for provider **{provider_name}**.")]
+            return [
+                types.TextContent(
+                    type="text",
+                    text=f"No voices found for provider **{provider_name}**.",
+                )
+            ]
 
         lines = [f"**Voices for {provider_name}** ({len(voices)} total):"]
-        for v in voices:
-            desc = f" - {v.description}" if v.description else ""
-            lines.append(f"  `{v.voice_id}` **{v.name}**{desc}")
+        for v in voices[:MAX_LISTED_VOICES]:
+            desc = f" - {str(v.description)[:300]}" if v.description else ""
+            lines.append(
+                f"  `{str(v.voice_id)[:MAX_VOICE_ID_CHARS]}` "
+                f"**{str(v.name)[:MAX_VOICE_NAME_CHARS]}**{desc}"
+            )
+        if len(voices) > MAX_LISTED_VOICES:
+            lines.append(f"... ({len(voices) - MAX_LISTED_VOICES} more voices omitted)")
 
-        return [types.TextContent(type="text", text="\n".join(lines))]
+        return [
+            types.TextContent(
+                type="text", text="\n".join(lines)[:MAX_TOOL_OUTPUT_CHARS]
+            )
+        ]
 
     if name == "generate_sfx":
         prompt = arguments.get("prompt")
         if not prompt:
-            return [types.TextContent(type="text", text="Missing required parameter: prompt")]
+            return [
+                types.TextContent(
+                    type="text", text="Missing required parameter: prompt"
+                )
+            ]
 
         sfx_providers = get_all_sfx()
         if not sfx_providers:
-            return [types.TextContent(type="text", text="No SFX providers configured. Set ELEVENLABS_API_KEY.")]
+            return [
+                types.TextContent(
+                    type="text",
+                    text="No SFX providers configured. Set ELEVENLABS_API_KEY.",
+                )
+            ]
 
         # Only ElevenLabs supports SFX for now
         provider_name = list(sfx_providers.keys())[0]
         provider = sfx_providers[provider_name]
 
-        duration = arguments.get("duration")
+        try:
+            prompt = _validate_string(prompt, "prompt", MAX_SFX_PROMPT_CHARS)
+            duration = arguments.get("duration")
+            if duration is not None:
+                duration = _validate_number(
+                    duration,
+                    "duration",
+                    MIN_SFX_DURATION,
+                    MAX_SFX_DURATION,
+                )
+            output_target = _audio_output_path(
+                AUDIO_OUTPUT_DIR,
+                "sfx",
+                arguments.get("output_path"),
+            )
+        except (ValueError, FileExistsError) as e:
+            return [types.TextContent(type="text", text=str(e))]
 
-        result = await provider.generate_sfx(prompt, duration=duration)
+        try:
+            result = await provider.generate_sfx(prompt, duration=duration)
+        except Exception as e:
+            return [
+                types.TextContent(
+                    type="text", text=f"SFX generation failed: {_bounded_error(e)}"
+                )
+            ]
 
         if result.status == "failed":
-            return [types.TextContent(type="text", text=f"SFX generation failed: {result.error}")]
+            return [
+                types.TextContent(
+                    type="text",
+                    text=f"SFX generation failed: {_bounded_error(result.error)}",
+                )
+            ]
 
-        # Save audio
-        output_path = arguments.get("output_path")
-        if output_path:
-            out = Path(output_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            if result.audio_data:
-                out.write_bytes(result.audio_data)
-                filepath = str(out)
-            else:
-                return [types.TextContent(type="text", text="No audio data returned")]
-        else:
-            output_dir = AUDIO_OUTPUT_DIR
-            if result.audio_data:
-                filepath = _save_audio_bytes(result.audio_data, output_dir, "sfx")
-            else:
-                return [types.TextContent(type="text", text="No audio data returned")]
+        try:
+            filepath = _save_audio_bytes(
+                result.audio_data,
+                AUDIO_OUTPUT_DIR,
+                "sfx",
+                output_path=str(output_target),
+            )
+        except (ValueError, FileExistsError, OSError) as e:
+            return [types.TextContent(type="text", text=str(e))]
 
-        return [types.TextContent(type="text", text=f"Sound effect generated.\nSaved to: {filepath}")]
+        return [
+            types.TextContent(
+                type="text", text=f"Sound effect generated.\nSaved to: {filepath}"
+            )
+        ]
 
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 

@@ -25,7 +25,9 @@
 - **最佳中文声音克隆** — Fish Audio 中文声音克隆效果极好，价格实惠
 - **优质英文语音** — ElevenLabs 提供自然、富有表现力的英文语音
 - **灵活切换** — 通过 `provider` 参数每次请求选择最优平台
-- **自动保存** — 生成的音频自动保存到本地
+- **安全自动保存** — MP3 使用微秒级文件名，绝不覆盖已有文件
+- **媒体大小门禁** — 克隆样本上限 25 MiB，Provider 音频响应上限 50 MiB
+- **请求校验** — TTS 语速、音效时长、文本长度、格式和 Provider 错误在 Schema 与运行时同时受限
 
 ## 支持的平台
 
@@ -58,7 +60,18 @@ cd mcp-voice-clone
 uv sync
 ```
 
-### 2. 配置 MCP
+### 2. 使用 Codex 任务 Profile
+
+本地服务器默认注册但禁用。按任务启动一个只启用语音能力的新 Codex 会话：
+
+```bash
+codex-mcp run voice -- --cd /path/to/project
+```
+
+Profile 只影响新会话，不会修改 Codex 基础配置。Provider Key 应保存在已注册的
+本地服务器配置中，不要写入仓库文件或命令历史。
+
+### 3. 兼容客户端配置
 
 只需配置你要使用的平台，至少配置一个。
 
@@ -105,7 +118,7 @@ claude mcp add -s user mcp-voice-clone \
 
 </details>
 
-### 3. 使用
+### 4. 使用
 
 克隆声音并生成语音：
 
@@ -121,11 +134,11 @@ claude mcp add -s user mcp-voice-clone \
 - **clone_voice** — 从音频样本克隆声音。参数：`audio_path`（必填）、`name`（必填）、`description`、`provider`（fish-audio/elevenlabs）。返回 voice_id 用于 `speak`。
 
 ### 语音
-- **speak** — 用克隆的声音或预设声音生成语音。参数：`text`（必填）、`voice_id`（必填）、`provider`（fish-audio/elevenlabs）、`speed`（0.5-2.0）、`output_path`。
+- **speak** — 用克隆声音或预设声音生成语音。参数：`text`（必填，最多 10,000 字符）、`voice_id`（必填）、`provider`、`speed`（0.7-1.2）、`output_path`（只能是新的 `.mp3`）。
 - **list_voices** — 列出平台可用的声音。参数：`provider`（fish-audio/elevenlabs）。
 
 ### 音效
-- **generate_sfx** — 从文字描述生成音效。参数：`prompt`（必填）、`duration`（秒数）、`output_path`。平台：ElevenLabs。
+- **generate_sfx** — 从文字描述生成音效。参数：`prompt`（必填，最多 2,000 字符）、`duration`（0.5-30 秒）、`output_path`（只能是新的 `.mp3`）。平台：ElevenLabs。
 
 ### 工具
 - **list_providers** — 列出所有已配置的声音克隆、TTS、音效平台。
@@ -146,7 +159,7 @@ claude mcp add -s user mcp-voice-clone \
 1. 访问 https://fish.audio → 注册
 2. 进入 **API Keys**：https://fish.audio/account/api-keys
 3. 点击 "Create API Key" → 复制
-4. 在 MCP 配置中设置 `FISH_AUDIO_API_KEY`
+4. 创建权限尽可能小的专用 Key，并在本地 MCP 配置中设置 `FISH_AUDIO_API_KEY`
 
 **声音克隆技巧：**
 - 上传 10-30 秒的清晰音频样本效果最好
@@ -170,7 +183,7 @@ claude mcp add -s user mcp-voice-clone \
 1. 访问 https://elevenlabs.io → 注册
 2. 进入 **Profile + API Key**：https://elevenlabs.io/app/settings/api-keys
 3. 点击 "Create API Key" → 复制
-4. 在 MCP 配置中设置 `ELEVENLABS_API_KEY`
+4. 创建仅允许所需语音能力的受限 Key，并在本地 MCP 配置中设置 `ELEVENLABS_API_KEY`
 
 **功能：**
 - 从短音频样本即时克隆声音（付费方案）
@@ -197,6 +210,10 @@ claude mcp add -s user mcp-voice-clone \
 | `No providers configured` | 没设置任何 API Key | 至少设置一个 API Key |
 | `Unknown provider` | 拼写错误或平台未配置 | 用 `list_providers` 查看可用选项 |
 | `Audio file not found` | audio_path 无效 | 检查文件路径是否存在且可访问 |
+| `Output file already exists` | 输出会覆盖已有文件 | 选择新的 `.mp3` 路径，或由用户明确删除旧文件 |
+| `Unsupported audio sample format` | 克隆样本格式不支持 | 使用 MP3、WAV、FLAC、OGG、M4A、AAC 或 WebM |
+| `Audio sample is too large` | 样本超过本地 25 MiB 安全上限 | 克隆前裁剪或压缩样本 |
+| `Provider response is too large` | 生成音频超过 50 MiB 上限 | 缩短文本或生成时长 |
 
 ### 平台特定错误
 
@@ -214,6 +231,8 @@ claude mcp add -s user mcp-voice-clone \
 - **ElevenLabs** 免费额度包含每月 10,000 字符 TTS 和预设声音
 - **声音克隆**效果很大程度取决于音频样本质量 — 使用清晰、干净的录音
 - **音效生成**接受自然语言描述，描述越具体效果越好
+- 自定义输出只能使用 `.mp3`，且不能指向已有文件；输出冲突会在可能计费的 Provider 请求前被拒绝。
+- Provider 音频采用流式读取并限制为 50 MiB；JSON 元数据和错误预览同样有大小边界。
 
 ## 项目结构
 
@@ -249,11 +268,10 @@ uv run voice-clone
 npx @modelcontextprotocol/inspector uv --directory . run voice-clone
 ```
 
-## 相关项目
+## 相关媒体工作流
 
-- [mcp-video-gen](https://github.com/kevinten-ai/mcp-video-gen) — AI 视频生成 MCP 服务器（7 个平台）
-- [mcp-image-gen](https://github.com/kevinten-ai/mcp-image-gen) — AI 图片生成 MCP 服务器（Gemini + Imagen）
-- [mcp-3d-gen](https://github.com/kevinten-ai/mcp-3d-gen) — AI 3D 模型生成 MCP 服务器
+图片生成、图片编辑和视频生成默认使用 AnyCap CLI，图片/视频 MCP 仅用于兼容测试。
+只有代理推理过程中确实需要声音克隆、TTS、声音查询或音效生成时，才通过 `voice` Profile 启用本 MCP。
 
 ## 许可证
 

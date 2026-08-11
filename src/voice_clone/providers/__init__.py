@@ -1,6 +1,95 @@
 from __future__ import annotations
+import json
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
+
+
+MAX_CLONE_SAMPLE_BYTES = 25 * 1024 * 1024
+MAX_AUDIO_RESPONSE_BYTES = 50 * 1024 * 1024
+MAX_ERROR_RESPONSE_BYTES = 64 * 1024
+MAX_JSON_RESPONSE_BYTES = 5 * 1024 * 1024
+AUDIO_SAMPLE_CONTENT_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".webm": "audio/webm",
+}
+
+
+def validate_audio_sample_path(audio_path: str) -> tuple[Path, str]:
+    if not isinstance(audio_path, str) or not audio_path.strip():
+        raise ValueError("audio_path must be a non-empty string")
+    path = Path(os.path.expanduser(audio_path))
+    if not path.is_file():
+        raise FileNotFoundError(f"Audio file not found: {path}")
+    content_type = AUDIO_SAMPLE_CONTENT_TYPES.get(path.suffix.lower())
+    if content_type is None:
+        supported = ", ".join(sorted(AUDIO_SAMPLE_CONTENT_TYPES))
+        raise ValueError(
+            f"Unsupported audio sample format. Supported extensions: {supported}"
+        )
+    size = path.stat().st_size
+    if size > MAX_CLONE_SAMPLE_BYTES:
+        raise ValueError(
+            f"Audio sample is too large ({size} bytes); maximum is {MAX_CLONE_SAMPLE_BYTES} bytes"
+        )
+    if size == 0:
+        raise ValueError("Audio sample is empty")
+    return path, content_type
+
+
+def load_audio_sample(audio_path: str) -> tuple[str, bytes, str]:
+    path, content_type = validate_audio_sample_path(audio_path)
+    with path.open("rb") as source:
+        data = source.read(MAX_CLONE_SAMPLE_BYTES + 1)
+    if len(data) > MAX_CLONE_SAMPLE_BYTES:
+        raise ValueError(
+            f"Audio sample is too large ({len(data)} bytes); maximum is {MAX_CLONE_SAMPLE_BYTES} bytes"
+        )
+    return path.name, data, content_type
+
+
+async def read_limited_stream(response, limit: int) -> bytes:
+    data = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(data) + len(chunk) > limit:
+            raise ValueError(
+                f"Provider response is too large; maximum is {limit} bytes"
+            )
+        data.extend(chunk)
+    return bytes(data)
+
+
+async def read_error_text(response) -> str:
+    try:
+        data = await read_limited_stream(response, MAX_ERROR_RESPONSE_BYTES)
+    except ValueError:
+        return "provider error response exceeded the safe preview limit"
+    return data.decode("utf-8", errors="replace").strip()[:1_000] or "unknown error"
+
+
+async def read_limited_json(response):
+    data = await read_limited_stream(response, MAX_JSON_RESPONSE_BYTES)
+    try:
+        return json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ValueError("Provider returned invalid JSON") from e
+
+
+def validate_audio_content_type(value: str | None) -> None:
+    if not value:
+        return
+    media_type = value.split(";", 1)[0].strip().lower()
+    if media_type.startswith("text/") or media_type in {
+        "application/json",
+        "application/problem+json",
+    }:
+        raise ValueError(f"Provider returned non-audio content type: {media_type}")
 
 
 @dataclass

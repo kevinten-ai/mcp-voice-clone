@@ -15,8 +15,10 @@ Multi-provider MCP server for voice cloning, advanced TTS, and sound effects. Fi
 - **Registry pattern**: Providers register at import time via `_init_providers()`, gated by env var presence
 - **Multi-interface providers**: FishAudioProvider implements both BaseTTSProvider and BaseVoiceCloningProvider
 - **Separate cloning registry**: Voice cloning providers tracked in `_voice_cloning_providers` dict (separate from TTS registry) since they implement a different ABC
-- **Raw audio responses**: Both Fish Audio and ElevenLabs return raw audio bytes (not base64), saved directly to disk
-- **Output flexibility**: `output_path` param allows exact file path; defaults to auto-generated timestamped filename in `AUDIO_OUTPUT_DIR`
+- **Bounded streaming audio**: Provider MP3 responses are streamed with a 50 MiB cap; obvious JSON/text responses are rejected
+- **Safe output**: `output_path` must be a new `.mp3`; defaults use microsecond timestamps in `AUDIO_OUTPUT_DIR`
+- **Bounded cloning input**: Samples use extension-specific MIME types and are limited to 25 MiB
+- **Schema/runtime parity**: Text, identifier, speed, duration, path, metadata, and output limits are enforced at both boundaries
 
 ## Provider Patterns
 
@@ -35,7 +37,8 @@ Fish Audio implements both TTS + cloning. ElevenLabs splits into 3 classes (TTS,
 - **ElevenLabs auth header**: Uses `xi-api-key` header (not `Authorization: Bearer`)
 - **ElevenLabs SFX**: Returns audio bytes stream directly, accept header must be `audio/mpeg`
 - **File path resolution**: `os.path.expanduser()` is called on audio_path to handle `~` paths
-- **Speed parameter**: Fish Audio uses `prosody.speed`, ElevenLabs does not support speed adjustment in the same way
+- **Speed parameter**: The unified 0.7–1.2 range is sent as Fish Audio `prosody.speed` and ElevenLabs `voice_settings.speed`
+- **Codex boundary**: Enable with `codex-mcp run voice`; image/video generation remains on AnyCap CLI
 
 ## Development
 

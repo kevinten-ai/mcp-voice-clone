@@ -9,7 +9,13 @@ from . import (
     BaseSFXProvider,
     BaseTTSProvider,
     BaseVoiceCloningProvider,
+    MAX_AUDIO_RESPONSE_BYTES,
     VoiceInfo,
+    load_audio_sample,
+    read_error_text,
+    read_limited_json,
+    read_limited_stream,
+    validate_audio_content_type,
 )
 
 
@@ -55,12 +61,14 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
                 "stability": 0.5,
                 "similarity_boost": 0.75,
                 "style": 0.0,
+                "speed": speed,
                 "use_speaker_boost": True,
             },
         }
 
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
+            async with client.stream(
+                "POST",
                 f"{self.BASE_URL}/v1/text-to-speech/{voice_id}",
                 headers={
                     **self._headers(),
@@ -69,23 +77,25 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
                 },
                 json=body,
                 timeout=120.0,
-            )
+            ) as resp:
+                if resp.status_code != 200:
+                    msg = await read_error_text(resp)
+                    return AudioResult(
+                        status="failed",
+                        error=f"ElevenLabs TTS failed (HTTP {resp.status_code}): {msg}",
+                    )
 
-            if resp.status_code != 200:
                 try:
-                    err = resp.json()
-                    msg = err.get("detail", {})
-                    if isinstance(msg, dict):
-                        msg = msg.get("message", resp.text)
-                    elif isinstance(msg, list) and msg:
-                        msg = str(msg[0])
-                except Exception:
-                    msg = resp.text
-                return AudioResult(status="failed", error=f"ElevenLabs TTS failed (HTTP {resp.status_code}): {msg}")
-
-            audio_data = resp.content
-            if not audio_data or len(audio_data) == 0:
-                return AudioResult(status="failed", error="ElevenLabs returned empty audio")
+                    validate_audio_content_type(resp.headers.get("content-type"))
+                    audio_data = await read_limited_stream(
+                        resp, MAX_AUDIO_RESPONSE_BYTES
+                    )
+                except ValueError as e:
+                    return AudioResult(status="failed", error=str(e))
+                if not audio_data:
+                    return AudioResult(
+                        status="failed", error="ElevenLabs returned empty audio"
+                    )
 
             return AudioResult(status="success", audio_data=audio_data)
 
@@ -97,19 +107,23 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
         voices: list[VoiceInfo] = []
 
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
+            async with client.stream(
+                "GET",
                 f"{self.BASE_URL}/v1/voices",
                 headers=self._headers(),
                 timeout=30.0,
-            )
-
-            if resp.status_code != 200:
-                return voices
-
-            data = resp.json()
-            items = data.get("voices", [])
+            ) as resp:
+                if resp.status_code != 200:
+                    return voices
+                try:
+                    data = await read_limited_json(resp)
+                except ValueError:
+                    return voices
+                items = data.get("voices", []) if isinstance(data, dict) else []
 
             for item in items:
+                if not isinstance(item, dict):
+                    continue
                 voice_id = item.get("voice_id", "")
                 name = item.get("name", "")
                 labels = item.get("labels", {})
@@ -122,12 +136,14 @@ class ElevenLabsTTSProvider(BaseTTSProvider):
                     desc_parts.append(label_str)
                 desc = " ".join(desc_parts) if desc_parts else None
 
-                voices.append(VoiceInfo(
-                    voice_id=voice_id,
-                    name=name,
-                    description=desc,
-                    provider=self.name,
-                ))
+                voices.append(
+                    VoiceInfo(
+                        voice_id=voice_id,
+                        name=name,
+                        description=desc,
+                        provider=self.name,
+                    )
+                )
 
         return voices
 
@@ -159,19 +175,10 @@ class ElevenLabsVoiceCloningProvider(BaseVoiceCloningProvider):
         POST /v1/voices/add — multipart upload with name, description, and audio files.
         Returns a VoiceInfo with the new voice_id.
         """
-        import os
-
-        audio_path_resolved = os.path.expanduser(audio_path)
-        if not os.path.isfile(audio_path_resolved):
-            raise FileNotFoundError(f"Audio file not found: {audio_path_resolved}")
-
-        filename = os.path.basename(audio_path_resolved)
-
-        with open(audio_path_resolved, "rb") as f:
-            audio_bytes = f.read()
+        filename, audio_bytes, content_type = load_audio_sample(audio_path)
 
         files = {
-            "files": (filename, audio_bytes, "audio/mpeg"),
+            "files": (filename, audio_bytes, content_type),
         }
         data: dict[str, str] = {
             "name": name,
@@ -180,26 +187,36 @@ class ElevenLabsVoiceCloningProvider(BaseVoiceCloningProvider):
             data["description"] = description
 
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
+            async with client.stream(
+                "POST",
                 f"{self.BASE_URL}/v1/voices/add",
                 headers=self._headers(),
                 data=data,
                 files=files,
                 timeout=120.0,
-            )
+            ) as resp:
+                try:
+                    result = await read_limited_json(resp)
+                except ValueError as e:
+                    raise RuntimeError(
+                        f"ElevenLabs clone_voice failed (HTTP {resp.status_code}): {e}"
+                    ) from e
 
             if resp.status_code != 200:
-                try:
-                    err = resp.json()
-                    msg = err.get("detail", {})
-                    if isinstance(msg, dict):
-                        msg = msg.get("message", resp.text)
-                except Exception:
-                    msg = resp.text
-                raise RuntimeError(f"ElevenLabs clone_voice failed (HTTP {resp.status_code}): {msg}")
+                msg = result.get("detail", {}) if isinstance(result, dict) else result
+                if isinstance(msg, dict):
+                    msg = msg.get("message", "unknown error")
+                raise RuntimeError(
+                    f"ElevenLabs clone_voice failed (HTTP {resp.status_code}): {str(msg)[:1_000]}"
+                )
 
-            result = resp.json()
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "ElevenLabs clone_voice returned an invalid response"
+                )
             voice_id = result.get("voice_id", "")
+            if not isinstance(voice_id, str) or not voice_id:
+                raise RuntimeError("ElevenLabs clone_voice returned no voice_id")
             return VoiceInfo(
                 voice_id=voice_id,
                 name=name,
@@ -244,7 +261,8 @@ class ElevenLabsSFXProvider(BaseSFXProvider):
             body["duration_seconds"] = duration
 
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
+            async with client.stream(
+                "POST",
                 f"{self.BASE_URL}/v1/sound-generation",
                 headers={
                     **self._headers(),
@@ -253,22 +271,24 @@ class ElevenLabsSFXProvider(BaseSFXProvider):
                 },
                 json=body,
                 timeout=120.0,
-            )
+            ) as resp:
+                if resp.status_code != 200:
+                    msg = await read_error_text(resp)
+                    return AudioResult(
+                        status="failed",
+                        error=f"ElevenLabs SFX failed (HTTP {resp.status_code}): {msg}",
+                    )
 
-            if resp.status_code != 200:
                 try:
-                    err = resp.json()
-                    msg = err.get("detail", {})
-                    if isinstance(msg, dict):
-                        msg = msg.get("message", resp.text)
-                    elif isinstance(msg, list) and msg:
-                        msg = str(msg[0])
-                except Exception:
-                    msg = resp.text
-                return AudioResult(status="failed", error=f"ElevenLabs SFX failed (HTTP {resp.status_code}): {msg}")
-
-            audio_data = resp.content
-            if not audio_data or len(audio_data) == 0:
-                return AudioResult(status="failed", error="ElevenLabs SFX returned empty audio")
+                    validate_audio_content_type(resp.headers.get("content-type"))
+                    audio_data = await read_limited_stream(
+                        resp, MAX_AUDIO_RESPONSE_BYTES
+                    )
+                except ValueError as e:
+                    return AudioResult(status="failed", error=str(e))
+                if not audio_data:
+                    return AudioResult(
+                        status="failed", error="ElevenLabs SFX returned empty audio"
+                    )
 
             return AudioResult(status="success", audio_data=audio_data)
